@@ -1,0 +1,1067 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>DM倉庫オーダー</title>
+<style>
+/* ダッシュボードのページが使う色・大きさの名前を、ここで決める（明るい／暗い） */
+:root {
+  color-scheme: light;
+  --color-bg: #f7f7f5; --color-panel: #ffffff; --color-fg: #1f1e1c; --color-fg-muted: #6b6963;
+  --color-border-line: #e3e1db; --color-ok: #2f7d4f; --color-warn: #a06a00; --color-bad: #b4372f;
+  --cds-chart-grid: #ecebe6; --cds-chart-axis: #c9c7c0; --cds-chart-muted: #a3a19a; --cds-chart-reference: #8f8d86;
+  --cds-surface-popover: #ffffff; --cds-border: #e3e1db; --cds-shadow-popover: 0 8px 24px rgba(0,0,0,.12), 0 2px 6px rgba(0,0,0,.08);
+  --cds-text-secondary: #6b6963;
+  --font-anthropic-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-anthropic-serif: "Hiragino Mincho ProN", "Noto Serif JP", "Yu Mincho", Georgia, serif;
+  --cds-font-size-caption: 0.8125rem; --cds-font-size-body: 0.9375rem; --cds-font-size-heading: 1.0625rem; --cds-font-size-title: 1.5rem;
+  --cds-font-weight-medium: 600;
+  --cds-gap-xs: 4px; --cds-gap-sm: 8px; --cds-gap-md: 12px; --cds-gap-lg: 20px; --cds-gap-xl: 32px;
+  --cds-pad-xs: 4px; --cds-pad-sm: 8px; --cds-pad-md: 12px; --cds-pad-lg: 16px; --cds-pad-xl: 24px;
+  --cds-radius: 8px; --cds-dur-slow: 300ms;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-bg: #1b1a18; --color-panel: #252421; --color-fg: #ecebe6; --color-fg-muted: #a3a19a;
+    --color-border-line: #3a3935; --color-ok: #6cc28f; --color-warn: #e0a83a; --color-bad: #ef7d73;
+    --cds-chart-grid: #33322e; --cds-chart-axis: #55534e; --cds-chart-muted: #7d7b74; --cds-chart-reference: #8f8d86;
+    --cds-surface-popover: #2e2d29; --cds-border: #44433e; --cds-shadow-popover: 0 8px 24px rgba(0,0,0,.4);
+    --cds-text-secondary: #a3a19a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #1b1a18; --color-panel: #252421; --color-fg: #ecebe6; --color-fg-muted: #a3a19a;
+  --color-border-line: #3a3935; --color-ok: #6cc28f; --color-warn: #e0a83a; --color-bad: #ef7d73;
+  --cds-chart-grid: #33322e; --cds-chart-axis: #55534e; --cds-chart-muted: #7d7b74; --cds-chart-reference: #8f8d86;
+  --cds-surface-popover: #2e2d29; --cds-border: #44433e; --cds-shadow-popover: 0 8px 24px rgba(0,0,0,.4);
+  --cds-text-secondary: #a3a19a;
+}
+html, body { margin: 0; }
+[hidden] { display: none !important; }
+img, svg { max-width: 100%; }
+body { background: var(--color-bg); color: var(--color-fg); font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-body); line-height: 1.5; }
+#dash-root { max-width: 1280px; margin-inline: auto; padding-block: 20px 40px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+#dash-root :is(b, strong) { font-weight: 600; }
+.dash-skeleton { color: transparent !important; background: var(--color-border-line); border-radius: 6px; min-height: 1em; min-width: 3em; display: inline-block; }
+div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+// dash-lite：Claude のダッシュボードの代わりに、data/ のファイルを読んでページに渡す小さな仕組み。
+(function () {
+  const FILES = {"total_daily": "data/total_daily.csv", "team_daily": "data/team_daily.csv", "sku_daily": "data/sku_daily.csv", "month_total": "data/month_total.json", "month_sku": "data/month_sku.json", "sync_status": "data/status.json"};
+  const DEFAULTS = { view: 'day', metric: 'orders', team: 'all' };
+  const cache = {}, calcs = {}, calcVal = {}, subs = [];
+  let params = { ...DEFAULTS }, queued = false, ver = 0;
+  const run = () => { queued = false; for (const fn of subs) { try { fn(); } catch (e) { console.error(e); } } };
+  const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(run); } };
+  function load(id) {
+    if (cache[id]) return;
+    cache[id] = { status: 'loading', data: [], ver: 0 };
+    fetchInto(id);
+  }
+  function fetchInto(id) {
+    const url = FILES[id] + '?t=' + Math.floor(Date.now() / 60000); // 1分ごとに新しいデータを取り直す
+    fetch(url, { cache: 'no-store' }).then((r) => { if (!r.ok) throw new Error(`${r.status} ${url}`); return url.includes('.csv') ? r.text().then((t) => d3.csvParse(t)) : r.json(); })
+      .then((rows) => { const data = Array.isArray(rows) ? Array.from(rows) : (rows.rows || rows.data || []); cache[id] = { status: 'ok', data, columns: rows.columns || Object.keys(data[0] || {}), ver: ++ver, meta: [] }; schedule(); })
+      .catch((e) => { if (cache[id].status !== 'ok') { cache[id] = { status: 'error', data: [], message: String(e), ver: ++ver }; schedule(); } });
+  }
+  function data(id) {
+    const c = calcs[id];
+    if (c) {
+      const ins = c.inputs.map(data);
+      if (ins.some((x) => x.status === 'error')) return { status: 'error', data: [], message: 'input failed' };
+      if (!ins.every((x) => x.status === 'ok')) return { status: 'loading', data: [] };
+      const key = ins.map((x) => x.ver).join('|');
+      if (!calcVal[id] || calcVal[id].key !== key) {
+        try { calcVal[id] = { key, v: { status: 'ok', data: c.fn(...ins.map((x) => x.data)), ver: ++ver } }; }
+        catch (e) { console.error(e); calcVal[id] = { key, v: { status: 'error', data: [], message: String(e), ver: ++ver } }; }
+      }
+      return calcVal[id].v;
+    }
+    if (!FILES[id]) return { status: 'missing', data: [] };
+    load(id);
+    return cache[id];
+  }
+  let lastW = 0;
+  addEventListener('resize', () => { const w = document.documentElement.clientWidth; if (w !== lastW) { lastW = w; schedule(); } });
+  window.dash = {
+    data, colors: ['#378ADD', '#1D9E75', '#D85A30', '#7F77DD', '#D4537E', '#BA7517', '#639922', '#888780'],
+    calc: (id, o) => { calcs[id] = o; },
+    loader: () => {},
+    onData: (fn) => { subs.push(fn); try { fn(); } catch (e) { console.error(e); } },
+    params: () => ({ ...params }),
+    setParams: (p) => { params = { ...params, ...p }; for (const k of Object.keys(p)) if (p[k] === null) delete params[k]; schedule(); },
+    resetParams: () => { params = { ...DEFAULTS }; schedule(); },
+    setLink: (name) => { try { history.replaceState(null, '', '#' + name); } catch (e) {} },
+    refresh: (id) => { if (cache[id]) fetchInto(id); },
+  };
+  // 開いたままにしている人のために、10分ごとにデータを読み直す
+  setInterval(() => { for (const id of Object.keys(cache)) fetchInto(id); }, 10 * 60 * 1000); // 表示中の数字は残したまま差し替える
+})();
+</script>
+</head>
+<body>
+<div id="dash-root">
+<style>
+.dm { display: grid; gap: var(--cds-gap-lg); font-family: var(--font-anthropic-sans); }
+.dm-top { display: flex; align-items: center; justify-content: space-between; gap: var(--cds-gap-md); flex-wrap: wrap; }
+.dm-top h1 { margin: 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); text-wrap: balance; }
+.dm-seg { display: inline-flex; border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); overflow: hidden; }
+.dm-seg button { font: inherit; font-size: var(--cds-font-size-body); padding: var(--cds-pad-xs) var(--cds-pad-lg); border: 0; background: transparent; color: var(--color-fg-muted); cursor: pointer; }
+.dm-seg button + button { border-left: 1px solid var(--color-border-line); }
+.dm-seg button[aria-pressed="true"] { background: var(--color-panel); color: var(--color-fg); font-weight: var(--cds-font-weight-medium); }
+.dm-seg button:focus-visible, .dm-nav button:focus-visible, .dm-chip:focus-visible, .dm-sort:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+.dm-page { display: grid; gap: var(--cds-gap-lg); }
+.dm-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--cds-gap-sm) var(--cds-gap-md); flex-wrap: wrap; }
+.dm-nav { display: inline-flex; align-items: center; gap: var(--cds-gap-sm); }
+.dm-nav button { font: inherit; width: 2rem; height: 2rem; border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-bg); color: var(--color-fg); cursor: pointer; }
+.dm-nav button:disabled { opacity: .35; cursor: default; }
+.dm-nav .dm-when { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); min-width: 9em; text-align: center; font-variant-numeric: tabular-nums; }
+.dm-cmp { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.dm-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); gap: var(--cds-gap-md); }
+.dm-card { position: relative; min-width: 0; background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); }
+.dm-kpi { display: grid; gap: var(--cds-gap-xs); align-content: start; }
+.dm-lbl { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.dm-n { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: 2.25rem; line-height: 1.1; font-variant-numeric: tabular-nums; min-height: 2.5rem; }
+.dm-n small { font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-body); color: var(--color-fg-muted); margin-left: 0.15em; }
+.dm-delta { font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; color: var(--color-fg-muted); min-height: 1.2em; }
+.dm-delta.up { color: var(--color-ok); }
+.dm-delta.down { color: var(--color-bad); }
+.dm-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: var(--cds-gap-md); }
+.dm-sec { display: grid; gap: var(--cds-gap-md); }
+.dm-sec > h2, .dm-card h2 { margin: 0; font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); }
+.dm-card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--cds-gap-sm); flex-wrap: wrap; margin-bottom: var(--cds-gap-sm); }
+.dm-legend { display: inline-flex; flex-wrap: wrap; gap: var(--cds-gap-md); color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); align-items: center; }
+.dm-legend span { display: inline-flex; align-items: center; gap: var(--cds-gap-xs); }
+.dm-sw { display: inline-block; width: 0.625rem; height: 0.625rem; border-radius: 3px; flex: none; }
+.dm-dash { display: inline-block; width: 1rem; border-top: 2px dashed var(--cds-chart-muted); }
+.dm-team-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--cds-gap-sm); flex-wrap: wrap; }
+.dm-team-head h3 { margin: 0; display: inline-flex; align-items: center; gap: var(--cds-gap-sm); font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); }
+.dm-sub { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dm-sub .dm-big { font-family: var(--font-anthropic-serif); font-size: var(--cds-font-size-title); }
+.dm-unit { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.dm-share { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); margin: var(--cds-gap-xs) 0 var(--cds-gap-sm); }
+.dm-tbl-wrap { overflow: auto; }
+.dm-team[data-team="nm"] .dm-tbl-wrap { max-height: 28rem; }
+#dm-month-table-wrap { max-height: 32rem; }
+.dm-tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: var(--cds-font-size-body); }
+.dm-tbl th { position: sticky; top: 0; z-index: 1; background: var(--color-panel); text-align: left; color: var(--color-fg-muted); font-weight: var(--cds-font-weight-medium); font-size: var(--cds-font-size-caption); white-space: nowrap; }
+.dm-tbl th, .dm-tbl td { padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); }
+.dm-tbl .dm-num { text-align: right; white-space: nowrap; }
+.dm-tbl td:first-child { word-break: break-all; }
+.dm-tbl td.up { color: var(--color-ok); }
+.dm-tbl td.down { color: var(--color-bad); }
+.dm-sort { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+th[aria-sort="descending"] .dm-sort::after { content: " ↓"; }
+th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
+.dm-filters { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm); align-items: center; }
+.dm-chip { font: inherit; font-size: var(--cds-font-size-caption); padding: var(--cds-pad-xs) var(--cds-pad-md); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-bg); color: var(--color-fg); cursor: pointer; }
+.dm-chip[aria-pressed="true"] { border-color: var(--color-fg); font-weight: var(--cds-font-weight-medium); }
+.dm-search { font: inherit; font-size: var(--cds-font-size-caption); padding: var(--cds-pad-xs) var(--cds-pad-sm); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-bg); color: var(--color-fg); width: 10rem; max-width: 100%; }
+.dm-chart { position: relative; min-height: 220px; }
+.dm-chart svg { display: block; }
+.dm-tick { font-size: 11px; fill: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
+.dm-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dm-tip .dm-tip-h { color: var(--cds-text-secondary); }
+.dm-failed { display: flex; align-items: center; justify-content: center; gap: var(--cds-gap-sm); min-height: 6rem; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.dm-failed i { width: 0.375rem; height: 0.375rem; border-radius: 50%; background: var(--color-bad); }
+.dm-picked { font: inherit; font-size: var(--cds-font-size-caption); padding: var(--cds-pad-xs) var(--cds-pad-md); border-radius: var(--cds-radius); border: 1px solid var(--color-fg); background: var(--color-bg); color: var(--color-fg); cursor: pointer; }
+.dm-picked:focus-visible, #dm-month-table tbody tr[data-sku]:focus-visible { outline: 2px solid var(--color-fg); outline-offset: -2px; }
+#dm-month-table tbody tr[data-sku] { cursor: pointer; }
+#dm-month-table tbody tr[data-sku]:hover td { background: var(--color-bg); }
+.dm-date-pick { font: inherit; font-size: var(--cds-font-size-body); padding: var(--cds-pad-xs) var(--cds-pad-sm); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-bg); color: var(--color-fg); font-variant-numeric: tabular-nums; }
+.dm-date-pick:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+.dm-cpick { display: grid; gap: var(--cds-gap-sm); }
+.dm-crow { display: flex; align-items: center; gap: var(--cds-gap-sm) var(--cds-gap-md); flex-wrap: wrap; }
+.dm-clabel { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); min-width: 5.5em; }
+.dm-csum td .dm-delta { min-height: 0; }
+.dm-csum td.dm-lbl { white-space: nowrap; }
+#dm-ctable-wrap { max-height: 32rem; }
+#dm-ctable tbody tr[data-sku] { cursor: pointer; }
+#dm-ctable tbody tr[data-sku]:hover td { background: var(--color-bg); }
+#dm-ctable tbody tr[data-sku]:focus-visible { outline: 2px solid var(--color-fg); outline-offset: -2px; }
+#dm-cchart { min-height: 240px; }
+.dm-status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--cds-gap-xs) var(--cds-gap-md); color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; min-height: 1.2em; }
+.dm-alert { display: flex; align-items: flex-start; gap: var(--cds-gap-sm); padding: var(--cds-pad-sm) var(--cds-pad-md); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-panel); font-size: var(--cds-font-size-body); color: var(--color-fg); width: 100%; }
+.dm-alert i { flex: none; width: 0.5rem; height: 0.5rem; border-radius: 50%; margin-top: 0.45em; }
+.dm-alert.bad { border-color: var(--color-bad); }
+.dm-alert.bad i { background: var(--color-bad); }
+.dm-alert.warn { border-color: var(--color-warn); }
+.dm-alert.warn i { background: var(--color-warn); }
+.dm-team.is-mine { border-color: var(--color-fg); }
+.dm-mine-tag { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); font-weight: 400; }
+.dm-team-toggle { font: inherit; font-size: var(--cds-font-size-caption); padding: var(--cds-pad-xs) var(--cds-pad-md); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-bg); color: var(--color-fg); cursor: pointer; }
+.dm-team-toggle:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+.dm-teams-wrap { display: grid; gap: var(--cds-gap-md); }
+.dm-sub .dm-delta { display: block; text-align: right; }
+.dm-tbl td.dm-name { word-break: normal; }
+.dm-empty { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); padding: var(--cds-pad-md) 0; }
+.dm [data-dash-source-state=empty] { color: transparent; }
+.dm [data-dash-source-state=refreshing] { opacity: .5; transition: opacity var(--cds-dur-slow); }
+</style>
+
+<div class="dm">
+  <div class="dm-top">
+    <h1 id="dm-title">DM倉庫オーダー</h1>
+    <div class="dm-seg" role="group" aria-label="表示の切り替え">
+      <button type="button" id="dm-view-day" data-view="day" aria-pressed="true">日次</button>
+      <button type="button" id="dm-view-month" data-view="month" aria-pressed="false">月間</button>
+      <button type="button" id="dm-view-compare" data-view="compare" aria-pressed="false">比較</button>
+    </div>
+  </div>
+  <div class="dm-status" id="dm-status" data-source="sync_status"></div>
+
+  <section class="dm-page" id="daily" aria-label="日次">
+    <div class="dm-bar">
+      <div class="dm-nav">
+        <button type="button" id="dm-day-prev" aria-label="前の日">‹</button>
+        <span class="dm-when dash-skeleton" id="dm-day-label" data-source="total_daily" data-field="date">—</span>
+        <button type="button" id="dm-day-next" aria-label="次の日">›</button>
+      </div>
+      <input type="date" class="dm-date-pick" id="dm-day-pick" aria-label="日付を選ぶ">
+      <div class="dm-filters"><span class="dm-cmp">自分の担当</span>
+        <div class="dm-seg" id="dm-myteam" role="group" aria-label="自分の担当">
+          <button type="button" data-team="all" aria-pressed="true">すべて</button>
+          <button type="button" data-team="tsuji" aria-pressed="false">辻</button>
+          <button type="button" data-team="mark" aria-pressed="false">マーク</button>
+          <button type="button" data-team="nm" aria-pressed="false">NM商品</button>
+        </div>
+      </div>
+    </div>
+    <div class="dm-kpis" id="dm-day-kpis">
+      <div class="dm-card dm-kpi"><span class="dm-lbl">オーダー数</span><span class="dm-n"><span class="dash-skeleton" data-kpi="orders" data-source="total_daily" data-field="orders">—</span><small>件</small></span><span class="dm-delta" id="dm-day-d-orders"></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">箱数</span><span class="dm-n"><span class="dash-skeleton" data-kpi="boxes" data-source="total_daily" data-field="boxes">—</span><small>箱</small></span><span class="dm-delta" id="dm-day-d-boxes"></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">出荷のあった商品</span><span class="dm-n"><span class="dash-skeleton" data-kpi="skus" data-source="total_daily" data-field="skus">—</span><small>SKU</small></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">1件あたりの箱数</span><span class="dm-n"><span class="dash-skeleton" id="dm-day-ratio" data-source="day_ratio" data-field="boxes_per_order">—</span><small>箱</small></span></div>
+    </div>
+    <div class="dm-sec" id="dm-teams">
+      <h2>担当ごとの明細</h2>
+      <div class="dm-teams-wrap" id="dm-teams-wrap"></div>
+    </div>
+  </section>
+
+  <section class="dm-page" id="monthly" aria-label="月間" hidden>
+    <div class="dm-bar">
+      <div class="dm-nav">
+        <button type="button" id="dm-month-prev" aria-label="前の月">‹</button>
+        <span class="dm-when dash-skeleton" id="dm-month-label" data-source="month_total" data-field="month">—</span>
+        <button type="button" id="dm-month-next" aria-label="次の月">›</button>
+      </div>
+      <div class="dm-filters">
+        <button type="button" class="dm-picked" id="dm-picked" hidden></button>
+        <span class="dm-cmp" id="dm-month-cmp"></span>
+      </div>
+    </div>
+    <div class="dm-kpis" id="dm-month-kpis">
+      <div class="dm-card dm-kpi"><span class="dm-lbl">月累計オーダー</span><span class="dm-n"><span class="dash-skeleton" data-source="month_total" data-field="orders">—</span><small>件</small></span><span class="dm-delta" data-source="month_total" data-field="orders_change"></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">月累計 箱数</span><span class="dm-n"><span class="dash-skeleton" data-source="month_total" data-field="boxes">—</span><small>箱</small></span><span class="dm-delta" data-source="month_total" data-field="boxes_change"></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">1日あたり</span><span class="dm-n"><span class="dash-skeleton" data-source="month_total" data-field="orders_per_day">—</span><small>件</small></span><span class="dm-delta">箱数 <span data-source="month_total" data-field="boxes_per_day">—</span>箱/日</span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">集計日数</span><span class="dm-n"><span class="dash-skeleton" data-source="month_total" data-field="days">—</span><small>日</small></span><span class="dm-delta" id="dm-month-span"></span></div>
+    </div>
+    <div class="dm-card" id="dm-month-chart-card">
+      <div class="dm-card-head">
+        <h2 id="dm-month-chart-title">日別オーダー数</h2>
+        <div class="dm-filters">
+          <span class="dm-legend" id="dm-month-legend"><span><span class="dm-sw" id="dm-month-sw"></span><span id="dm-month-leg-cur">今月</span></span><span><span class="dm-dash"></span><span id="dm-month-leg-prev">前月</span></span></span>
+          <div class="dm-seg" role="group" aria-label="グラフの単位">
+            <button type="button" class="dm-metric" data-metric="orders" aria-pressed="true">件数</button>
+            <button type="button" class="dm-metric" data-metric="boxes" aria-pressed="false">箱数</button>
+          </div>
+        </div>
+      </div>
+      <div class="dm-chart dash-skeleton" id="dm-month-chart" data-source="total_daily"></div>
+    </div>
+    <div class="dm-card" id="dm-month-sku">
+      <div class="dm-card-head">
+        <h2>商品別（月累計）</h2>
+        <div class="dm-filters" id="dm-sku-filters">
+          <div class="dm-filters" id="dm-team-chips" role="group" aria-label="担当で絞り込み"></div>
+          <input type="search" class="dm-search" id="dm-q" placeholder="商品名・SKUで検索" aria-label="商品名・SKUで検索">
+        </div>
+      </div>
+      <div class="dm-tbl-wrap" id="dm-month-table-wrap">
+        <table class="dm-tbl" id="dm-month-table" data-source="month_sku" data-row-key="month,sku">
+          <thead><tr>
+            <th scope="col" data-field="short"><button type="button" class="dm-sort" data-key="short">商品</button></th>
+            <th scope="col" data-field="team"><button type="button" class="dm-sort" data-key="team">担当</button></th>
+            <th scope="col" class="dm-num" data-field="orders"><button type="button" class="dm-sort" data-key="orders">件数</button></th>
+            <th scope="col" class="dm-num" data-field="boxes" aria-sort="descending"><button type="button" class="dm-sort" data-key="boxes">箱数</button></th>
+            <th scope="col" class="dm-num" data-field="prev_boxes"><button type="button" class="dm-sort" data-key="prev_boxes">前月同期</button></th>
+            <th scope="col" class="dm-num" data-field="diff_boxes"><button type="button" class="dm-sort" data-key="diff_boxes">増減</button></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  <section class="dm-page" id="compare" aria-label="比較" hidden>
+    <div class="dm-cpick">
+      <div class="dm-crow"><span class="dm-clabel">比べる月</span><div class="dm-filters" id="dm-cmonths" role="group" aria-label="比べる月"></div></div>
+      <div class="dm-crow"><span class="dm-clabel">比べる範囲</span>
+        <div class="dm-seg" role="group" aria-label="比べる範囲">
+          <button type="button" class="dm-crange" id="dm-crange-same" data-range="same" aria-pressed="true">同じ日まで</button>
+          <button type="button" class="dm-crange" data-range="full" aria-pressed="false">月全体</button>
+        </div>
+        <span class="dm-cmp" id="dm-cbase"></span>
+        <button type="button" class="dm-picked" id="dm-cpicked" hidden></button>
+      </div>
+    </div>
+    <div class="dm-card" id="dm-csum-card">
+      <h2 id="dm-csum-title">数字の比較</h2>
+      <div class="dm-tbl-wrap">
+        <table class="dm-tbl dm-csum" id="dm-csum"><thead><tr></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+    <div class="dm-card" id="dm-cchart-card">
+      <div class="dm-card-head">
+        <h2 id="dm-cchart-title">日ごとの累計オーダー数</h2>
+        <div class="dm-filters">
+          <div class="dm-seg" role="group" aria-label="累計か日別か">
+            <button type="button" class="dm-cmode" data-mode="cum" aria-pressed="true">累計</button>
+            <button type="button" class="dm-cmode" data-mode="daily" aria-pressed="false">日別</button>
+          </div>
+          <div class="dm-seg" role="group" aria-label="グラフの単位">
+            <button type="button" class="dm-cmetric" data-metric="orders" aria-pressed="true">件数</button>
+            <button type="button" class="dm-cmetric" data-metric="boxes" aria-pressed="false">箱数</button>
+          </div>
+        </div>
+      </div>
+      <div class="dm-chart dash-skeleton" id="dm-cchart" data-source="month_cum"></div>
+    </div>
+    <div class="dm-card" id="dm-cproducts">
+      <div class="dm-card-head">
+        <h2 id="dm-ctable-title">商品別の比較</h2>
+        <div class="dm-filters" id="dm-cfilters">
+          <div class="dm-filters" id="dm-cteam-chips" role="group" aria-label="担当で絞り込み"></div>
+          <input type="search" class="dm-search" id="dm-cq" placeholder="商品名・SKUで検索" aria-label="商品名・SKUで検索">
+        </div>
+      </div>
+      <div class="dm-tbl-wrap" id="dm-ctable-wrap" data-source="sku_cum">
+        <table class="dm-tbl" id="dm-ctable"><thead><tr></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  const TEAMS = [['tsuji', '辻'], ['mark', 'マーク'], ['nm', 'NM商品'], ['none', '担当未設定']];
+  const TEAM_IDS = TEAMS.map((t) => t[0]);
+  const fmt = d3.format(',');
+  const fmtChange = d3.format('+.1%');
+  const root = document.getElementById('dash-root') || document;
+  const $ = (s) => root.querySelector(s);
+  const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+  const mark = (n, source, field, where) => { n.dataset.source = source; n.dataset.field = field; if (where) n.dataset.where = where; else delete n.dataset.where; return n; };
+  // 値がデータにないとき（出荷のない日など）は出典を外す
+  const unmark = (n) => { delete n.dataset.source; delete n.dataset.field; delete n.dataset.where; return n; };
+  // 商品の短い名前・正式な名前（sku_daily にある最新の名前）
+  const names = { short: {}, product: {} };
+  const learnNames = () => { const d = dash.data('sku_daily'); if (d.status === 'ok' && !names.loaded) { for (const r of d.data) { names.short[r.sku] = r.short || r.sku; names.product[r.sku] = r.product || r.sku; } names.loaded = true; } };
+  const shortOf = (sku) => { learnNames(); return names.short[sku] || sku; };
+  const productOf = (sku) => { learnNames(); return names.product[sku] || sku; };
+  const matches = (r, text) => [r.short, r.sku, r.product].some((v) => v && String(v).toLowerCase().includes(text));
+  const teamColor = (id) => dash.colors[Math.max(TEAM_IDS.indexOf(id), 0)];
+  const WD = '日月火水木金土';
+  const dayLabel = (s) => { const d = new Date(s + 'T00:00:00Z'); return isNaN(d) ? s : `${d.getUTCMonth() + 1}月${d.getUTCDate()}日（${WD[d.getUTCDay()]}）`; };
+  const md = (s) => `${Number(s.slice(5, 7))}/${Number(s.slice(8, 10))}`;
+  const monthLabel = (m) => `${m.slice(0, 4)}年${Number(m.slice(5, 7))}月`;
+  const monthName = (m) => `${Number(m.slice(5, 7))}月`;
+
+  dash.calc('day_ratio', {
+    inputs: ['total_daily'],
+    title: '1件あたりの箱数（日別）',
+    description: 'その日の箱数をオーダー数で割った値。',
+    fn: (total_daily) => total_daily.map((r) => ({ date: r.date, boxes_per_order: Number(r.orders) ? Number(r.boxes) / Number(r.orders) : 0 })),
+  });
+
+  // ---- 切り替えと操作 ----
+  let sort = { key: 'boxes', dir: -1 };
+  let q = '';
+  const VIEWS = { day: 'daily', month: 'monthly', compare: 'compare' };
+  const view = () => (VIEWS[dash.params().view] ? dash.params().view : 'day');
+  const named = (location.hash || '').slice(1);
+  const fromHash = Object.keys(VIEWS).find((k) => VIEWS[k] === named);
+  if (fromHash) dash.setParams({ view: fromHash });
+
+  root.querySelectorAll('.dm-top .dm-seg button').forEach((b) => b.addEventListener('click', () => {
+    dash.setParams({ view: b.dataset.view });
+    dash.setLink(VIEWS[b.dataset.view]);
+  }));
+  root.querySelectorAll('.dm-metric').forEach((b) => b.addEventListener('click', () => dash.setParams({ metric: b.dataset.metric })));
+  $('#dm-q').addEventListener('input', (e) => { q = e.target.value.trim().toLowerCase(); draw(); });
+  root.querySelectorAll('.dm-sort').forEach((b) => b.addEventListener('click', () => {
+    const k = b.dataset.key;
+    sort = sort.key === k ? { key: k, dir: -sort.dir } : { key: k, dir: (k === 'short' || k === 'team') ? 1 : -1 };
+    draw();
+  }));
+  $('#dm-month-table tbody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-sku]');
+    if (tr) { dash.setParams({ sku: tr.dataset.sku }); $('#monthly').scrollIntoView({ block: 'start' }); }
+  });
+  $('#dm-month-table tbody').addEventListener('keydown', (e) => {
+    const tr = e.target.closest('tr[data-sku]');
+    if (tr && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); dash.setParams({ sku: tr.dataset.sku }); }
+  });
+  $('#dm-picked').addEventListener('click', () => dash.setParams({ sku: null }));
+  const pick = $('#dm-day-pick');
+  let pickDay = null;
+  const showPick = () => { if (pickDay) pick.value = pickDay; };
+  pick.addEventListener('change', () => {
+    if (pick.value && pick.validity.valid && (!pick.min || pick.value >= pick.min) && (!pick.max || pick.value <= pick.max)) dash.setParams({ day: pick.value });
+  });
+  pick.addEventListener('blur', showPick);
+  const stepper = (prevId, nextId, list, cur, param) => {
+    const i = list.indexOf(cur);
+    $(prevId).disabled = i <= 0;
+    $(nextId).disabled = i < 0 || i >= list.length - 1;
+    $(prevId).onclick = () => { if (i > 0) dash.setParams({ [param]: list[i - 1] }); };
+    $(nextId).onclick = () => { if (i >= 0 && i < list.length - 1) dash.setParams({ [param]: list[i + 1] }); };
+  };
+
+  function failed(box) {
+    const f = el('div', 'dm-failed');
+    f.append(el('i'), el('span', null, 'Failed to load'));
+    box.append(f);
+  }
+
+  // ---- 日次 ----
+  // 自分の担当：見る人ごとにこのブラウザで覚える（他の人には影響しない）
+  const MY_KEY = 'dm-my-team';
+  let myTeam = 'all';
+  try { const v = localStorage.getItem(MY_KEY); if (['all', 'tsuji', 'mark', 'nm'].includes(v)) myTeam = v; } catch (e) {}
+  const openCards = new Set(); // 折りたたんだカードのうち、開いたもの
+  root.querySelectorAll('#dm-myteam button').forEach((b) => b.addEventListener('click', () => {
+    myTeam = b.dataset.team; openCards.clear();
+    try { localStorage.setItem(MY_KEY, myTeam); } catch (e) {}
+    draw();
+  }));
+  const signed = (v, f = fmt) => (v > 0 ? '+' : v < 0 ? '−' : '±') + f(Math.abs(v));
+  function setDayDelta(n, cur, prev, prevDate) {
+    n.classList.remove('up', 'down');
+    if (cur == null || prev == null || !prevDate) { n.textContent = ''; return; }
+    const v = prev ? (cur - prev) / prev : null;
+    n.textContent = `前日（${md(prevDate)}）比 ${v == null ? '—' : fmtChange(v)}`;
+    if (v > 0) n.classList.add('up'); else if (v < 0) n.classList.add('down');
+  }
+
+  function teamCard(card, team, items, date, state, o) {
+    card.replaceChildren();
+    const id = card.dataset.team;
+    const name = (TEAMS.find((t) => t[0] === id) || [id, id])[1];
+    card.classList.toggle('is-mine', !!o.mine);
+    const w = `date=${date}&team_id=${id}`;
+    const head = el('div', 'dm-team-head');
+    const h = el('h3');
+    const sw = el('span', 'dm-sw'); sw.style.background = teamColor(id);
+    h.append(sw, team ? mark(el('span', null, team.team), 'team_daily', 'team', w) : el('span', null, name));
+    if (o.mine) h.append(el('span', 'dm-mine-tag', '自分の担当'));
+    const sub = el('div', 'dm-sub');
+    if (team) sub.append(
+      mark(el('span', 'dm-big', fmt(Number(team.orders))), 'team_daily', 'orders', w), el('span', 'dm-unit', ' 件 / '),
+      mark(el('span', 'dm-big', fmt(Number(team.boxes))), 'team_daily', 'boxes', w), el('span', 'dm-unit', ' 箱'));
+    else sub.append(el('span', 'dm-big', state === 'ok' ? '0' : '—'), el('span', 'dm-unit', ' 件'));
+    if (state === 'ok' && o.prevDate) {
+      const dl = el('span', 'dm-delta');
+      const pt = o.prevTeam;
+      setDayDelta(dl, team ? Number(team.boxes) : 0, pt ? Number(pt.boxes) : 0, o.prevDate);
+      if (dl.textContent) dl.textContent = dl.textContent.replace('比 ', '比 箱数 ');
+      sub.append(dl);
+    }
+    head.append(h, sub);
+    card.append(head);
+    const share = el('p', 'dm-share');
+    if (team) share.append(mark(el('span', null, String(team.skus)), 'team_daily', 'skus', w), '商品');
+    else share.textContent = state === 'ok' ? 'この日の出荷なし' : '—';
+    if (o.collapsible && items.length) {
+      const open = openCards.has(id);
+      const t = el('button', 'dm-team-toggle', open ? '表を閉じる' : '表を開く'); t.type = 'button';
+      t.setAttribute('aria-expanded', String(open));
+      t.addEventListener('click', () => { if (openCards.has(id)) openCards.delete(id); else openCards.add(id); draw(); });
+      share.append('　', t);
+    }
+    card.append(share);
+    if (state === 'error') { failed(card); return; }
+    if (state === 'loading') { const s = el('div', 'dash-skeleton'); s.style.minHeight = '6rem'; card.append(s); return; }
+    if (!items.length || (o.collapsible && !openCards.has(id))) return;
+    const wrap = el('div', 'dm-tbl-wrap');
+    const t = el('table', 'dm-tbl');
+    t.dataset.source = 'sku_daily'; t.dataset.rowKey = 'date,sku';
+    const tr = el('tr');
+    const cols = [['short', '商品', ''], ['orders', 'オーダー', 'dm-num'], ['boxes', '箱数', 'dm-num']];
+    if (o.prevDate) cols.push([null, `前日（${md(o.prevDate)}）比`, 'dm-num']);
+    cols.forEach(([f, label, cls]) => { const th = el('th', cls, label); if (f) th.dataset.field = f; th.scope = 'col'; tr.append(th); });
+    const thead = el('thead'); thead.append(tr);
+    const tbody = el('tbody');
+    for (const r of items) {
+      const row = el('tr');
+      row.dataset.key = `${r.date},${encodeURIComponent(r.sku)}`;
+      row.title = `${r.product || r.sku}\n${r.sku}`;
+      row.append(el('td', 'dm-name', r.short || r.sku), el('td', 'dm-num', fmt(Number(r.orders))), el('td', 'dm-num', fmt(Number(r.boxes))));
+      if (o.prevDate) {
+        const p = o.prevBoxes.get(r.sku) || 0, d = Number(r.boxes) - p;
+        const td = el('td', 'dm-num', signed(d)); if (d > 0) td.classList.add('up'); else if (d < 0) td.classList.add('down');
+        row.append(td);
+      }
+      tbody.append(row);
+    }
+    t.append(thead, tbody);
+    wrap.append(t);
+    card.append(wrap);
+  }
+
+  function drawDay(ok, err) {
+    const tot = dash.data('total_daily'), tm = dash.data('team_daily'), sk = dash.data('sku_daily'), dr = dash.data('day_ratio');
+    const dates = ok ? tot.data.map((r) => r.date).sort() : [];
+    const P = dash.params();
+    const first = dates[0], last = dates[dates.length - 1];
+    const date = ok ? (P.day && P.day >= first && P.day <= last ? P.day : last) : null;
+    // カレンダーで出荷のない日（土日など）を選んだときも、その日を表示する
+    const stepDates = date && !dates.includes(date) ? [...dates, date].sort() : dates;
+    stepper('#dm-day-prev', '#dm-day-next', stepDates, date, 'day');
+    if (ok) { pick.min = first; pick.max = last; }
+    pickDay = date;
+    if (pick !== document.activeElement) showPick();
+    // 前日＝直前にデータのある日
+    const prevDate = date ? dates.filter((d) => d < date).pop() || null : null;
+    const w = date ? `date=${date}` : null;
+    const row = ok ? tot.data.find((r) => r.date === date) : null;
+    const prow = ok && prevDate ? tot.data.find((r) => r.date === prevDate) : null;
+    const lab = $('#dm-day-label');
+    if (row || !ok) mark(lab, 'total_daily', 'date', w); else unmark(lab);
+    lab.textContent = date ? dayLabel(date) : '—';
+    root.querySelectorAll('#dm-day-kpis [data-kpi]').forEach((n) => {
+      const f = n.dataset.kpi;
+      if (row || !ok) mark(n, 'total_daily', f, w); else unmark(n);
+      n.textContent = row ? fmt(Number(row[f])) : ok ? '0' : '—';
+    });
+    for (const f of ['orders', 'boxes']) setDayDelta($(`#dm-day-d-${f}`), ok ? Number(row ? row[f] : 0) : null, prow ? Number(prow[f]) : null, prevDate);
+    const rr = ok ? dr.data.find((r) => r.date === date) : null;
+    const rn = $('#dm-day-ratio');
+    if (rr || !ok) mark(rn, 'day_ratio', 'boxes_per_order', w); else unmark(rn);
+    rn.textContent = rr ? d3.format('.1f')(rr.boxes_per_order) : '—';
+
+    // 担当カード：「すべて」なら 辻・マーク を並べて NM商品 を下に。担当を選んだら、その担当を一番上に開き、他は折りたたむ。
+    root.querySelectorAll('#dm-myteam button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.team === myTeam)));
+    const hasNone = ok && tm.data.some((t) => t.date === date && t.team_id === 'none');
+    const order = ['tsuji', 'mark', 'nm', ...(hasNone ? ['none'] : [])];
+    const wrap = $('#dm-teams-wrap');
+    const cardOf = (id) => { let c = root.querySelector(`#dm-team-${id}`); if (!c) { c = el('div', 'dm-card dm-team'); c.id = `dm-team-${id}`; c.dataset.team = id; } return c; };
+    const render = (id, opts) => {
+      const card = cardOf(id);
+      const team = ok ? tm.data.find((t) => t.date === date && t.team_id === id) : null;
+      const prevTeam = ok && prevDate ? tm.data.find((t) => t.date === prevDate && t.team_id === id) : null;
+      const items = ok ? sk.data.filter((r) => r.date === date && r.team_id === id).sort((a, b) => Number(b.boxes) - Number(a.boxes)) : [];
+      const prevBoxes = new Map(ok && prevDate ? sk.data.filter((r) => r.date === prevDate && r.team_id === id).map((r) => [r.sku, Number(r.boxes)]) : []);
+      teamCard(card, team, items, date, err ? 'error' : ok ? 'ok' : 'loading', { ...opts, prevDate, prevTeam, prevBoxes });
+      return card;
+    };
+    if (myTeam === 'all') {
+      const g = el('div', 'dm-grid2'); g.append(render('tsuji', {}), render('mark', {}));
+      wrap.replaceChildren(g, ...order.slice(2).map((id) => render(id, {})));
+    } else {
+      const others = order.filter((id) => id !== myTeam);
+      const g = el('div', 'dm-grid2'); g.append(...others.map((id) => render(id, { collapsible: true })));
+      wrap.replaceChildren(render(myTeam, { mine: true }), g);
+    }
+  }
+
+  // ---- 月間 ----
+  function tipFor(box) {
+    let t = box.querySelector('.dm-tip');
+    if (!t) { t = el('div', 'dm-tip'); t.hidden = true; box.append(t); }
+    return t;
+  }
+  function showTip(box, e, lines) {
+    const t = tipFor(box);
+    t.replaceChildren(el('div', 'dm-tip-h', lines[0]), ...lines.slice(1).map((l) => el('div', null, l)));
+    t.hidden = false;
+    const b = box.getBoundingClientRect();
+    let x = e.clientX - b.left + 12, y = e.clientY - b.top + 12;
+    if (x + t.offsetWidth > b.width) x = e.clientX - b.left - t.offsetWidth - 12;
+    if (y + t.offsetHeight > b.height) y = b.height - t.offsetHeight;
+    t.style.left = Math.max(x, 0) + 'px';
+    t.style.top = Math.max(y, 0) + 'px';
+  }
+
+  function drawMonthChart(box, mt, cur, prev, metric) {
+    box.replaceChildren();
+    const y0 = Number(mt.month.slice(0, 4)), m0 = Number(mt.month.slice(5, 7));
+    const dim = new Date(Date.UTC(y0, m0, 0)).getUTCDate();
+    const W = Math.max(box.clientWidth, 280), H = 220, top = 10, bottom = 24, right = 6;
+    const val = (r) => Number(r[metric]);
+    const yMax = d3.max([...cur, ...prev], val) || 1;
+    const y = d3.scaleLinear([0, yMax], [H - bottom, top]).nice();
+    const svg = d3.select(box).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img')
+      .attr('aria-label', `${monthLabel(mt.month)}の日別${metric === 'orders' ? 'オーダー数' : '箱数'}`);
+    const ticks = y.ticks(4);
+    const tg = svg.append('g');
+    let left = 0;
+    for (const v of ticks) left = Math.max(left, tg.append('text').attr('class', 'dm-tick').text(fmt(v)).node().getComputedTextLength());
+    tg.remove();
+    left += 8;
+    const x = d3.scaleBand(d3.range(1, dim + 1), [left, W - right]).paddingInner(0.25).paddingOuter(0.1);
+    const g = svg.append('g');
+    for (const v of ticks) {
+      g.append('line').attr('x1', left).attr('x2', W - right).attr('y1', y(v)).attr('y2', y(v)).attr('stroke', v ? 'var(--cds-chart-grid)' : 'var(--cds-chart-axis)').attr('stroke-width', 1);
+      g.append('text').attr('class', 'dm-tick').attr('x', left - 6).attr('y', y(v)).attr('dy', '0.35em').attr('text-anchor', 'end').text(fmt(v));
+    }
+    const step = x.step() * 5 >= 26 ? 5 : 10;
+    for (const d of d3.range(1, dim + 1)) {
+      if (d !== 1 && d % step !== 0 && d !== dim) continue;
+      if (d === dim && dim % step !== 0 && (dim % step) < 3) continue;
+      g.append('text').attr('class', 'dm-tick').attr('x', x(d) + x.bandwidth() / 2).attr('y', H - 6).attr('text-anchor', 'middle').text(d);
+    }
+    const dayOf = (r) => Number(r.date.slice(8, 10));
+    svg.append('g').selectAll('rect').data(cur).join('rect')
+      .attr('x', (r) => x(dayOf(r))).attr('width', x.bandwidth())
+      .attr('y', (r) => y(val(r))).attr('height', (r) => Math.max(y(0) - y(val(r)), 1))
+      .attr('rx', Math.min(3, x.bandwidth() / 2)).attr('fill', dash.colors[0]);
+    const pts = prev.filter((r) => dayOf(r) <= dim).sort((a, b) => dayOf(a) - dayOf(b));
+    if (pts.length) {
+      svg.append('path').attr('fill', 'none').attr('stroke', 'var(--cds-chart-muted)').attr('stroke-width', 1.5).attr('stroke-dasharray', '4 3')
+        .attr('d', d3.line().x((r) => x(dayOf(r)) + x.bandwidth() / 2).y((r) => y(val(r)))(pts));
+      svg.append('g').selectAll('circle').data(pts).join('circle').attr('r', 2).attr('fill', 'var(--cds-chart-muted)')
+        .attr('cx', (r) => x(dayOf(r)) + x.bandwidth() / 2).attr('cy', (r) => y(val(r)));
+    }
+    const unit = metric === 'orders' ? '件' : '箱';
+    const curBy = new Map(cur.map((r) => [dayOf(r), r])), prevBy = new Map(pts.map((r) => [dayOf(r), r]));
+    svg.append('g').selectAll('rect').data(d3.range(1, dim + 1)).join('rect')
+      .attr('x', (d) => x(d) - x.step() * x.paddingInner() / 2).attr('width', x.step()).attr('y', top).attr('height', H - bottom - top).attr('fill', 'transparent')
+      .on('pointerenter pointermove', (e, d) => {
+        const c = curBy.get(d), p = prevBy.get(d);
+        const dt = `${mt.month}-${String(d).padStart(2, '0')}`;
+        showTip(box, e, [dayLabel(dt), `${monthName(mt.month)} ${c ? fmt(val(c)) + unit : 'なし'}`, `${monthName(mt.prev_month)}${d}日 ${p ? fmt(val(p)) + unit : 'なし'}`]);
+      })
+      .on('pointerleave', () => { const t = box.querySelector('.dm-tip'); if (t) t.hidden = true; });
+  }
+
+  function setDelta(n, v, w, src, none) {
+    mark(n, src || 'month_total', n.dataset.field, w);
+    n.classList.remove('up', 'down');
+    if (v == null) { n.textContent = w ? (none || '前月のデータなし') : ''; return; }
+    n.textContent = `前月同期 ${fmtChange(v)}`;
+    if (v > 0) n.classList.add('up'); else if (v < 0) n.classList.add('down');
+  }
+
+  function drawMonth(ok, err) {
+    const mtD = dash.data('month_total'), tot = dash.data('total_daily'), ms = dash.data('month_sku');
+    const months = ok ? mtD.data.map((r) => r.month) : [];
+    const P = dash.params();
+    const month = ok ? (months.includes(P.month) ? P.month : months[months.length - 1]) : null;
+    stepper('#dm-month-prev', '#dm-month-next', months, month, 'month');
+    const mt = ok ? mtD.data.find((r) => r.month === month) : null;
+    const w = month ? `month=${month}` : null;
+    const lab = $('#dm-month-label'); mark(lab, 'month_total', 'month', w); lab.textContent = month ? monthLabel(month) : '—';
+    $('#dm-month-cmp').textContent = !mt ? '' : mt.prev_orders == null ? '比較できる前月のデータがありません'
+      : mt.partial ? `比較：${monthName(mt.prev_month)}1日〜${mt.cutoff}日` : `比較：${monthName(mt.prev_month)}全体`;
+    // 商品を選んでいるときは、ページ全体をその商品だけにする
+    const rowsAll = ok ? ms.data.filter((r) => r.month === month) : [];
+    const sku = ok && P.sku && ms.data.some((r) => r.sku === P.sku) ? P.sku : null;
+    const sr = sku ? rowsAll.find((r) => r.sku === sku) : null;
+    const picked = $('#dm-picked');
+    picked.hidden = !sku;
+    const skuName = sku ? shortOf(sku) : '';
+    picked.textContent = sku ? `${skuName} ×` : '';
+    picked.title = sku ? `${productOf(sku)}\n${sku}` : '';
+    picked.setAttribute('aria-label', sku ? `${skuName} の絞り込みを解除` : '絞り込みを解除');
+    $('#dm-sku-filters').hidden = !!sku;
+    const src = sku ? 'month_sku' : 'month_total';
+    const sw = sku ? `month=${month}&sku=${encodeURIComponent(sku)}` : w;
+    const kv = (f) => sku ? (sr ? sr[f] : 0) : (mt ? mt[f] : null);
+    root.querySelectorAll('#dm-month-kpis .dm-n [data-field], #dm-month-kpis [data-field="boxes_per_day"]').forEach((n) => {
+      const f = n.dataset.field;
+      if (f === 'days') { mark(n, 'month_total', 'days', w); n.textContent = mt ? fmt(mt.days) : '—'; return; }
+      mark(n, src, f, sku && !sr ? null : sw);
+      const v = kv(f);
+      n.textContent = v == null ? '—' : f.endsWith('_per_day') ? fmt(Math.round(v)) : fmt(v);
+    });
+    root.querySelectorAll('#dm-month-kpis .dm-delta[data-field$="_change"]').forEach((n) => {
+      if (sku && !sr) { setDelta(n, null, null); n.textContent = 'この月の出荷なし'; return; }
+      setDelta(n, kv(n.dataset.field), mt ? sw : null, src, sku ? '前月の出荷なし' : null);
+    });
+    $('#dm-month-span').textContent = mt ? `${md(mt.first)}〜${md(mt.last)}` : '';
+
+    const metric = P.metric === 'boxes' ? 'boxes' : 'orders';
+    root.querySelectorAll('.dm-metric').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.metric === metric)));
+    $('#dm-month-chart-title').textContent = (metric === 'orders' ? '日別オーダー数' : '日別の箱数') + (sku ? `（${skuName}）` : '');
+    $('#dm-month-sw').style.background = dash.colors[0];
+    $('#dm-month-leg-cur').textContent = mt ? monthName(mt.month) : '今月';
+    $('#dm-month-leg-prev').textContent = mt ? `${monthName(mt.prev_month)}（同じ日）` : '前月';
+    const box = $('#dm-month-chart');
+    box.dataset.source = sku ? 'sku_daily' : 'total_daily';
+    const daily = !ok ? [] : sku ? dash.data('sku_daily').data.filter((r) => r.sku === sku) : tot.data;
+    if (err) { box.replaceChildren(); failed(box); }
+    else if (mt) drawMonthChart(box, mt, daily.filter((r) => r.date.startsWith(month)), daily.filter((r) => r.date.startsWith(mt.prev_month)), metric);
+    else box.replaceChildren();
+
+    const rowsM = sku ? rowsAll.filter((r) => r.sku === sku) : rowsAll;
+    const present = TEAMS.filter(([id]) => id !== 'none' || rowsAll.some((r) => r.team_id === 'none'));
+    const team = present.some(([id]) => id === P.team) ? P.team : 'all';
+    $('#dm-team-chips').replaceChildren(...[['all', 'すべて'], ...present].map(([id, name]) => {
+      const b = el('button', 'dm-chip', name); b.type = 'button'; b.setAttribute('aria-pressed', String(id === team));
+      b.addEventListener('click', () => dash.setParams({ team: id })); return b;
+    }));
+
+    const tbody = $('#dm-month-table tbody');
+    tbody.replaceChildren();
+    root.querySelectorAll('#dm-month-table th').forEach((th) => {
+      const k = th.querySelector('.dm-sort').dataset.key;
+      if (k === sort.key) th.setAttribute('aria-sort', sort.dir > 0 ? 'ascending' : 'descending'); else th.removeAttribute('aria-sort');
+    });
+    if (err) { const tr = el('tr'); const td = el('td'); td.colSpan = 6; failed(td); tr.append(td); tbody.append(tr); return; }
+    const list = sku ? rowsM : rowsM.filter((r) => (team === 'all' || r.team_id === team) && (!q || matches(r, q)));
+    const k = sort.key;
+    list.sort((a, b) => {
+      const va = a[k], vb = b[k];
+      if (typeof va === 'string' || typeof vb === 'string') return sort.dir * String(va ?? '').localeCompare(String(vb ?? ''), 'ja');
+      return sort.dir * ((va ?? -Infinity) - (vb ?? -Infinity));
+    });
+    if (ok && !list.length) { const tr = el('tr'); const td = el('td', 'dm-empty', sku ? 'この月はこの商品の出荷がありません' : q ? '該当するSKUがありません' : 'この月の出荷はありません'); td.colSpan = 6; tr.append(td); tbody.append(tr); return; }
+    for (const r of list) {
+      const tr = el('tr');
+      tr.dataset.key = `${r.month},${encodeURIComponent(r.sku)}`;
+      tr.dataset.sku = r.sku; tr.tabIndex = 0; tr.title = `${r.product || r.sku}\n${r.sku}\n押すとこの商品だけ表示`;
+      const diff = el('td', 'dm-num', r.diff_boxes == null ? '—' : (r.diff_boxes > 0 ? '+' : r.diff_boxes < 0 ? '−' : '±') + fmt(Math.abs(r.diff_boxes)));
+      if (r.diff_boxes > 0) diff.classList.add('up'); else if (r.diff_boxes < 0) diff.classList.add('down');
+      tr.append(el('td', 'dm-name', r.short || r.sku), el('td', null, r.team), el('td', 'dm-num', fmt(r.orders)), el('td', 'dm-num', fmt(r.boxes)),
+        el('td', 'dm-num', r.prev_boxes == null ? '—' : fmt(r.prev_boxes)), diff);
+      tbody.append(tr);
+    }
+  }
+
+  // ---- 比較 ----
+  // 選んだ月を、同じ日まで（1〜N日）または月全体で並べる。増減は一番古い月が基準。
+  dash.calc('month_cum', {
+    inputs: ['total_daily'],
+    title: '月ごとの日別累計',
+    description: '各月の1日からその日までのオーダー数・箱数の累計。出荷のない日は前の日と同じ値。1日あたりは出荷のあった日数で、1件あたりはオーダー数で割る。',
+    fn: (total_daily) => {
+      const by = {};
+      for (const r of total_daily) { const m = r.date.slice(0, 7); (by[m] = by[m] || {})[Number(r.date.slice(8, 10))] = r; }
+      const out = [];
+      for (const m of Object.keys(by).sort()) {
+        const days = by[m];
+        const last = Math.max(...Object.keys(days).map(Number));
+        let o = 0, b = 0, n = 0;
+        for (let d = 1; d <= last; d++) {
+          const r = days[d];
+          if (r) { o += Number(r.orders); b += Number(r.boxes); n += 1; }
+          out.push({ month: m, day: d, last_day: last, orders: o, boxes: b, ship_days: n, orders_per_day: n ? o / n : 0, boxes_per_order: o ? b / o : 0 });
+        }
+      }
+      return out;
+    },
+  });
+
+  dash.calc('sku_cum', {
+    inputs: ['sku_daily'],
+    title: '商品別の日別累計',
+    description: '商品ごとに、各月の1日からその日までのオーダー数・箱数の累計。月の最後の日はその月のデータの最後の日。',
+    fn: (sku_daily) => {
+      const by = {}, lastOf = {};
+      for (const r of sku_daily) {
+        const m = r.date.slice(0, 7), d = Number(r.date.slice(8, 10));
+        lastOf[m] = Math.max(lastOf[m] || 0, d);
+        const k = m + '|' + r.sku;
+        (by[k] = by[k] || { month: m, sku: r.sku, short: r.short, product: r.product, team_id: r.team_id, team: r.team, days: {} }).days[d] = r;
+      }
+      const out = [];
+      for (const k of Object.keys(by).sort()) {
+        const g = by[k];
+        let o = 0, b = 0, n = 0;
+        for (let d = 1; d <= lastOf[g.month]; d++) {
+          const r = g.days[d];
+          if (r) { o += Number(r.orders); b += Number(r.boxes); n += 1; }
+          out.push({ month: g.month, sku: g.sku, short: g.short, product: g.product, team_id: g.team_id, team: g.team, day: d, last_day: lastOf[g.month], orders: o, boxes: b, ship_days: n,
+            orders_per_day: n ? o / n : 0, boxes_per_order: o ? b / o : 0 });
+        }
+      }
+      return out;
+    },
+  });
+
+  let csort = { key: null, dir: -1 };
+  let cq = '';
+  $('#dm-cq').addEventListener('input', (e) => { cq = e.target.value.trim().toLowerCase(); draw(); });
+  root.querySelectorAll('.dm-crange').forEach((b) => b.addEventListener('click', () => dash.setParams({ cmp_range: b.dataset.range })));
+  root.querySelectorAll('.dm-cmetric').forEach((b) => b.addEventListener('click', () => dash.setParams({ cmp_metric: b.dataset.metric })));
+  root.querySelectorAll('.dm-cmode').forEach((b) => b.addEventListener('click', () => dash.setParams({ cmp_mode: b.dataset.mode })));
+  $('#dm-cpicked').addEventListener('click', () => dash.setParams({ cmp_sku: null }));
+  $('#dm-ctable tbody').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-sku]');
+    if (tr) { dash.setParams({ cmp_sku: tr.dataset.sku }); $('#compare').scrollIntoView({ block: 'start' }); }
+  });
+  $('#dm-ctable tbody').addEventListener('keydown', (e) => {
+    const tr = e.target.closest('tr[data-sku]');
+    if (tr && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); dash.setParams({ cmp_sku: tr.dataset.sku }); }
+  });
+  $('#dm-ctable thead').addEventListener('click', (e) => {
+    const b = e.target.closest('.dm-csort'); if (!b) return;
+    const k = b.dataset.key;
+    csort = csort.key === k ? { key: k, dir: -csort.dir } : { key: k, dir: k === 'short' || k === 'team' ? 1 : -1 };
+    draw();
+  });
+
+  const pct = (v, base) => (base ? (v - base) / base : null);
+  function setChange(n, v) {
+    n.classList.remove('up', 'down');
+    n.textContent = v == null ? '' : fmtChange(v);
+    if (v > 0) n.classList.add('up'); else if (v < 0) n.classList.add('down');
+  }
+
+  function drawCompareChart(box, sel, series, maxDay, metric, mode) {
+    box.replaceChildren();
+    const W = Math.max(box.clientWidth, 280), H = 240, top = 12, bottom = 24;
+    const val = (p) => p[mode][metric];
+    const all = series.flatMap((s) => s.points);
+    const y = d3.scaleLinear([0, d3.max(all, val) || 1], [H - bottom, top]).nice();
+    const svg = d3.select(box).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img')
+      .attr('aria-label', `${sel.map(monthName).join('・')}の${mode === 'cum' ? '累計' : '日別'}${metric === 'orders' ? 'オーダー数' : '箱数'}`);
+    const ticks = y.ticks(4);
+    const tg = svg.append('g');
+    let left = 0, right = 0;
+    for (const v of ticks) left = Math.max(left, tg.append('text').attr('class', 'dm-tick').text(fmt(v)).node().getComputedTextLength());
+    for (const s of series) right = Math.max(right, tg.append('text').attr('class', 'dm-tick').text(monthName(s.month)).node().getComputedTextLength());
+    tg.remove();
+    left += 8; right += 12;
+    const x = d3.scaleLinear([1, Math.max(maxDay, 2)], [left, W - right]);
+    const g = svg.append('g');
+    for (const v of ticks) {
+      g.append('line').attr('x1', left).attr('x2', W - right).attr('y1', y(v)).attr('y2', y(v)).attr('stroke', v ? 'var(--cds-chart-grid)' : 'var(--cds-chart-axis)').attr('stroke-width', 1);
+      g.append('text').attr('class', 'dm-tick').attr('x', left - 6).attr('y', y(v)).attr('dy', '0.35em').attr('text-anchor', 'end').text(fmt(v));
+    }
+    const xt = [1, ...d3.range(5, maxDay + 1, 5)];
+    if (maxDay - xt[xt.length - 1] >= 3) xt.push(maxDay);
+    for (const d of xt) g.append('text').attr('class', 'dm-tick').attr('x', x(d)).attr('y', H - 6).attr('text-anchor', 'middle').text(`${d}日`);
+    const line = d3.line().x((p) => x(p.day)).y((p) => y(val(p)));
+    const ends = [];
+    series.forEach((s) => {
+      if (!s.points.length) return;
+      svg.append('path').attr('fill', 'none').attr('stroke', s.color).attr('stroke-width', 2).attr('stroke-linecap', 'round').attr('stroke-linejoin', 'round').attr('d', line(s.points));
+      const lp = s.points[s.points.length - 1];
+      svg.append('circle').attr('cx', x(lp.day)).attr('cy', y(val(lp))).attr('r', 3).attr('fill', s.color);
+      ends.push({ s, x: x(lp.day), y: y(val(lp)) });
+    });
+    // 線の端の月名が重ならないように、上から順に間を空ける
+    ends.sort((a, b) => a.y - b.y);
+    let prevY = -Infinity;
+    for (const e of ends) {
+      const ly = Math.max(e.y, prevY + 13); prevY = ly;
+      svg.append('text').attr('class', 'dm-tick').attr('x', e.x + 6).attr('y', ly).attr('dy', '0.35em').style('fill', e.s.color).text(monthName(e.s.month));
+    }
+    const rule = svg.append('line').attr('y1', top).attr('y2', H - bottom).attr('stroke', 'var(--cds-chart-reference)').attr('stroke-width', 1).style('display', 'none');
+    const unit = metric === 'orders' ? '件' : '箱';
+    svg.append('rect').attr('x', left).attr('y', top).attr('width', W - right - left).attr('height', H - bottom - top).attr('fill', 'transparent')
+      .on('pointermove', (e) => {
+        const [mx] = d3.pointer(e);
+        const d = Math.min(maxDay, Math.max(1, Math.round(x.invert(mx))));
+        rule.attr('x1', x(d)).attr('x2', x(d)).style('display', null);
+        const lines = [`${d}日${mode === 'cum' ? 'までの累計' : ''}`];
+        for (const s of series) { const p = s.points.find((q) => q.day === d); lines.push(`${monthName(s.month)} ${p ? fmt(val(p)) + unit : 'なし'}`); }
+        showTip(box, e, lines);
+      })
+      .on('pointerleave', () => { rule.style('display', 'none'); const t = box.querySelector('.dm-tip'); if (t) t.hidden = true; });
+  }
+
+  function drawCompare(ok, err) {
+    const mc = dash.data('month_cum'), sc = dash.data('sku_cum');
+    const P = dash.params();
+    const months = ok ? [...new Set(mc.data.map((r) => r.month))].sort() : [];
+    let sel = Array.isArray(P.cmp_months) ? P.cmp_months.filter((m) => months.includes(m)).sort() : null;
+    if (ok && (!sel || !Array.isArray(P.cmp_months))) sel = months.slice(-3);
+    sel = sel || [];
+    const colorOf = (m) => dash.colors[sel.indexOf(m) % dash.colors.length];
+    // 月のボタン
+    $('#dm-cmonths').replaceChildren(...months.map((m) => {
+      const b = el('button', 'dm-chip', monthName(m)); b.type = 'button';
+      const on = sel.includes(m); b.setAttribute('aria-pressed', String(on));
+      if (on) { b.style.borderColor = colorOf(m); b.style.boxShadow = `inset 0 0 0 1px ${colorOf(m)}`; }
+      b.addEventListener('click', () => dash.setParams({ cmp_months: on ? sel.filter((x) => x !== m) : [...sel, m].sort() }));
+      return b;
+    }));
+    const range = P.cmp_range === 'full' ? 'full' : 'same';
+    root.querySelectorAll('.dm-crange').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === range)));
+    const lastDay = (m) => { const r = mc.data.find((x) => x.month === m); return r ? r.last_day : 0; };
+    const N = sel.length ? Math.min(...sel.map(lastDay)) : 0;
+    const dayFor = (m) => (range === 'same' ? N : lastDay(m));
+    $('#dm-crange-same').textContent = N ? `同じ日まで（1〜${N}日）` : '同じ日まで';
+    $('#dm-cbase').textContent = sel.length >= 2 ? `増減の基準：${monthName(sel[0])}（一番古い月）` : '比べる月を2つ以上選んでください';
+    const sku = ok && P.cmp_sku && sc.data.some((r) => r.sku === P.cmp_sku) ? P.cmp_sku : null;
+    const picked = $('#dm-cpicked');
+    const skuName = sku ? shortOf(sku) : '';
+    picked.hidden = !sku; picked.textContent = sku ? `${skuName} ×` : '';
+    picked.title = sku ? `${productOf(sku)}\n${sku}` : '';
+    picked.setAttribute('aria-label', sku ? `${skuName} の絞り込みを解除` : '絞り込みを解除');
+    $('#dm-cfilters').hidden = !!sku;
+    $('#dm-csum-title').textContent = `数字の比較（${range === 'same' ? (N ? `1〜${N}日` : '') : '月全体'}${sku ? `・${skuName}` : ''}）`;
+
+    // 数字の比較
+    const src = sku ? 'sku_cum' : 'month_cum';
+    const rowAt = (m) => (sku ? sc.data.find((r) => r.month === m && r.sku === sku && r.day === dayFor(m)) : mc.data.find((r) => r.month === m && r.day === dayFor(m)));
+    const where = (m) => `month=${m}${sku ? `&sku=${encodeURIComponent(sku)}` : ''}&day=${dayFor(m)}`;
+    const METRICS = [['orders', 'オーダー数', fmt, true], ['boxes', '箱数', fmt, true], ['orders_per_day', '1日あたり件数', (v) => fmt(Math.round(v)), true], ['boxes_per_order', '1件あたり箱数', d3.format('.2f'), false]];
+    const head = $('#dm-csum thead tr'); head.replaceChildren(el('th', null, ''));
+    for (const m of sel) { const th = el('th', 'dm-num'); const sw = el('span', 'dm-sw'); sw.style.background = colorOf(m); th.append(sw, ' ', monthName(m) + (range === 'full' && lastDay(m) < 28 ? `（${lastDay(m)}日まで）` : '')); head.append(th); }
+    const body = $('#dm-csum tbody'); body.replaceChildren();
+    if (err) { const tr = el('tr'); const td = el('td'); td.colSpan = sel.length + 1; failed(td); tr.append(td); body.append(tr); }
+    else for (const [f, label, format, showChange] of METRICS) {
+      const tr = el('tr'); tr.append(el('td', 'dm-lbl', label));
+      const baseRow = sel.length ? rowAt(sel[0]) : null;
+      sel.forEach((m, i) => {
+        const r = rowAt(m); const td = el('td', 'dm-num');
+        const v = el('div', null, r ? format(r[f]) : ok ? '0' : '—');
+        if (r) mark(v, src, f, where(m));
+        td.append(v);
+        if (showChange && i > 0) { const c = el('div', 'dm-delta'); setChange(c, r && baseRow ? pct(r[f], baseRow[f]) : null); td.append(c); }
+        tr.append(td);
+      });
+      body.append(tr);
+    }
+
+    // 累計グラフ
+    const metric = P.cmp_metric === 'boxes' ? 'boxes' : 'orders';
+    const mode = P.cmp_mode === 'daily' ? 'daily' : 'cum';
+    root.querySelectorAll('.dm-cmetric').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.metric === metric)));
+    root.querySelectorAll('.dm-cmode').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+    $('#dm-cchart-title').textContent = `日ごとの${mode === 'cum' ? '累計' : ''}${metric === 'orders' ? 'オーダー数' : '箱数'}${sku ? `（${skuName}）` : ''}`;
+    const box = $('#dm-cchart');
+    box.dataset.source = src;
+    const maxDay = sel.length ? Math.max(...sel.map(dayFor)) : 0;
+    if (err) { box.replaceChildren(); failed(box); }
+    else if (ok && sel.length) {
+      const series = sel.map((m) => {
+        const rows = (sku ? sc.data.filter((r) => r.month === m && r.sku === sku) : mc.data.filter((r) => r.month === m)).filter((r) => r.day <= dayFor(m)).sort((a, b) => a.day - b.day);
+        let po = 0, pb = 0;
+        const points = rows.map((r) => { const p = { day: r.day, cum: { orders: r.orders, boxes: r.boxes }, daily: { orders: r.orders - po, boxes: r.boxes - pb } }; po = r.orders; pb = r.boxes; return p; });
+        return { month: m, color: colorOf(m), points };
+      });
+      drawCompareChart(box, sel, series, maxDay, metric, mode);
+    } else box.replaceChildren();
+
+    // 商品別の比較
+    const cm = P.cmp_metric === 'boxes' ? 'boxes' : 'orders';
+    $('#dm-ctable-title').textContent = `商品別の比較（${cm === 'orders' ? '件数' : '箱数'}）`;
+    const present = TEAMS.filter(([id]) => id !== 'none' || (ok && sc.data.some((r) => r.team_id === 'none' && sel.includes(r.month))));
+    const team = present.some(([id]) => id === P.cmp_team) ? P.cmp_team : 'all';
+    $('#dm-cteam-chips').replaceChildren(...[['all', 'すべて'], ...present].map(([id, name]) => {
+      const b = el('button', 'dm-chip', name); b.type = 'button'; b.setAttribute('aria-pressed', String(id === team));
+      b.addEventListener('click', () => dash.setParams({ cmp_team: id })); return b;
+    }));
+    const thr = $('#dm-ctable thead tr');
+    const cols = [['short', '商品', ''], ['team', '担当', ''], ...sel.map((m) => [m, monthName(m), 'dm-num']), ...(sel.length >= 2 ? [['change', `${monthName(sel[0])}→${monthName(sel[sel.length - 1])}`, 'dm-num']] : [])];
+    if (!csort.key || !cols.some((c) => c[0] === csort.key)) csort = { key: sel[sel.length - 1] || 'short', dir: -1 };
+    thr.replaceChildren(...cols.map(([k, label, cls]) => {
+      const th = el('th', cls); th.scope = 'col';
+      if (k === csort.key) th.setAttribute('aria-sort', csort.dir > 0 ? 'ascending' : 'descending');
+      const b = el('button', 'dm-sort dm-csort', label); b.type = 'button'; b.dataset.key = k; th.append(b); return th;
+    }));
+    const tb = $('#dm-ctable tbody'); tb.replaceChildren();
+    if (err) { const tr = el('tr'); const td = el('td'); td.colSpan = cols.length; failed(td); tr.append(td); tb.append(tr); return; }
+    if (!ok) return;
+    const bySku = {};
+    for (const r of sc.data) {
+      if (!sel.includes(r.month) || r.day !== dayFor(r.month)) continue;
+      const a = bySku[r.sku] || (bySku[r.sku] = { sku: r.sku, short: r.short || r.sku, product: r.product, team_id: r.team_id, team: r.team });
+      a[r.month] = r[cm];
+    }
+    let list = Object.values(bySku).map((a) => {
+      for (const m of sel) a[m] = a[m] || 0;
+      a.change = sel.length >= 2 ? pct(a[sel[sel.length - 1]], a[sel[0]]) : null;
+      return a;
+    }).filter((a) => sel.some((m) => a[m] > 0));
+    list = sku ? list.filter((a) => a.sku === sku) : list.filter((a) => (team === 'all' || a.team_id === team) && (!cq || matches(a, cq)));
+    const k = csort.key;
+    list.sort((a, b) => {
+      const va = a[k], vb = b[k];
+      if (typeof va === 'string' || typeof vb === 'string') return csort.dir * String(va ?? '').localeCompare(String(vb ?? ''), 'ja');
+      return csort.dir * ((va ?? -Infinity) - (vb ?? -Infinity));
+    });
+    if (!list.length) { const tr = el('tr'); const td = el('td', 'dm-empty', cq ? '該当するSKUがありません' : '選んだ月に出荷がありません'); td.colSpan = cols.length; tr.append(td); tb.append(tr); return; }
+    for (const a of list) {
+      const tr = el('tr'); tr.dataset.sku = a.sku; tr.tabIndex = 0; tr.title = `${a.product || a.sku}\n${a.sku}\n押すとこの商品だけ表示`;
+      tr.append(el('td', 'dm-name', a.short), el('td', null, a.team), ...sel.map((m) => el('td', 'dm-num', fmt(a[m]))));
+      if (sel.length >= 2) { const td = el('td', 'dm-num'); setChange(td, a.change); if (a.change == null) td.textContent = a[sel[sel.length - 1]] ? '新規' : '—'; tr.append(td); }
+      tb.append(tr);
+    }
+  }
+
+  // ---- 最終更新と注意 ----
+  // 日本時間の「日付」「時刻」を Date から取り出す
+  const jstParts = (d) => { const t = new Date(d.getTime() + 9 * 3600e3); return { ymd: t.toISOString().slice(0, 10), hm: t.toISOString().slice(11, 16), dow: t.getUTCDay() }; };
+  const at = (iso) => { const d = new Date(iso); if (isNaN(d)) return '—'; const p = jstParts(d); return `${md(p.ymd)} ${p.hm}`; };
+  // 直近で「もう確認の記録が届いているはず」の予定時刻（予定から1時間たったもの）
+  function lastDueSlot(st, now) {
+    const list = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+    const hol = new Set(list(st.holidays)), wd = new Set(list(st.weekdays || '1,2,3,4,5').map(Number));
+    const slots = list(st.schedule).sort().reverse();
+    for (let k = 0; k < 10; k++) {
+      const day = new Date(now.getTime() - k * 86400e3), p = jstParts(day);
+      if (!wd.has(p.dow) || hol.has(p.ymd)) continue;
+      for (const s of slots) {
+        const t = new Date(`${p.ymd}T${s}:00+09:00`);
+        if (t.getTime() + 3600e3 <= now.getTime()) return t;
+      }
+    }
+    return null;
+  }
+  function drawStatus() {
+    const box = $('#dm-status');
+    const d = dash.data('sync_status');
+    box.replaceChildren();
+    if (d.status === 'error' || d.status === 'declined') { failed(box); return; }
+    if (d.status !== 'ok' || !d.data[0]) return;
+    const st = d.data[0];
+    const alerts = [];
+    const yes = (v) => v === true || v === 'true' || v === 'True' || v === 1 || v === '1';
+    const ss = st.sheet_at ? { at: st.sheet_at, ok: yes(st.sheet_ok), text: st.sheet_text } : null;
+    if (ss && !ss.ok) {
+      const login = /認証|ログイン/.test(ss.text || '');
+      alerts.push(['bad', `${at(ss.at)} のシート同期に失敗しました（${ss.text || '理由不明'}）。${login ? 'オーダー管理サイトにブラウザでログインし直してください。' : ''}ダッシュボードの数字はそれより前の同期時点のままです。`]);
+    }
+    if (!yes(st.ok) && st.problem) alerts.push(['bad', `${at(st.checked_at)} のダッシュボード更新に失敗しました（${st.problem}）。数字はそれより前の時点のままです。`]);
+    const due = lastDueSlot(st, new Date());
+    if (due && new Date(st.checked_at) < due) {
+      const p = jstParts(due);
+      alerts.push(['warn', `${md(p.ymd)} ${p.hm} の自動更新が届いていません。更新が遅れています（更新を動かしているMacが起動しているか確認してください）。`]);
+    }
+    for (const [kind, text] of alerts) { const a = el('div', `dm-alert ${kind}`); a.append(el('i'), el('span', null, text)); box.append(a); }
+    box.append(
+      el('span', null, `最終確認 ${at(st.checked_at)}`),
+      el('span', null, `データの更新 ${st.data_changed_at ? at(st.data_changed_at) : '—'}`),
+      el('span', null, ss ? `シート同期 ${at(ss.at)} ${ss.ok ? '完了' : '失敗'}` : 'シート同期 —'),
+      el('span', null, `自動更新 平日 ${String(st.schedule || '').split(',').join('／')}`));
+  }
+
+  function draw() {
+    const v = view();
+    // 開いているページで使うデータだけ読む
+    const ids = { day: ['total_daily', 'team_daily', 'sku_daily', 'day_ratio'], month: ['total_daily', 'sku_daily', 'month_total', 'month_sku'], compare: ['month_cum', 'sku_cum'] }[v];
+    const st = ids.map((id) => dash.data(id));
+    const ok = st.every((x) => x.status === 'ok');
+    const err = st.some((x) => x.status === 'error' || x.status === 'declined');
+    root.querySelectorAll('.dm .dash-skeleton, .dm [data-skel]').forEach((n) => {
+      if (n.closest('.dm-team')) return;
+      n.setAttribute('data-skel', '1');
+      n.classList.toggle('dash-skeleton', !ok && !err);
+    });
+    root.querySelectorAll('.dm-top .dm-seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === v)));
+    $('#daily').hidden = v !== 'day';
+    $('#monthly').hidden = v !== 'month';
+    $('#compare').hidden = v !== 'compare';
+    drawStatus();
+    if (v === 'day') drawDay(ok, err); else if (v === 'month') drawMonth(ok, err); else drawCompare(ok, err);
+  }
+
+  dash.onData(draw);
+})();
+</script>
+
+</div>
+</body>
+</html>
