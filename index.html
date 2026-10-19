@@ -48,6 +48,13 @@ body { background: var(--color-bg); color: var(--color-fg); font-family: var(--f
 #dash-root :is(b, strong) { font-weight: 600; }
 .dash-skeleton { color: transparent !important; background: var(--color-border-line); border-radius: 6px; min-height: 1em; min-width: 3em; display: inline-block; }
 div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
+.manual-refresh { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:10px; margin-bottom:12px; }
+.manual-refresh button { font:inherit; font-weight:600; color:var(--color-fg); background:var(--color-panel); border:1px solid var(--color-border-line); border-radius:8px; padding:9px 16px; cursor:pointer; }
+.manual-refresh button:hover { border-color:var(--color-fg-muted); }
+.manual-refresh button:focus-visible { outline:2px solid #378ADD; outline-offset:3px; }
+.manual-refresh button:disabled { opacity:.6; cursor:wait; }
+.manual-refresh small { color:var(--color-fg-muted); }
+#manual-refresh-message { width:100%; text-align:right; font-size:13px; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 <script>
@@ -107,6 +114,10 @@ div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
 </head>
 <body>
 <div id="dash-root">
+<div class="manual-refresh">
+<small>このMacから実行</small><button id="manual-refresh-button" type="button">↻ 今すぐ更新</button>
+<div id="manual-refresh-message" role="status" aria-live="polite"></div>
+</div>
 <style>
 .dm { display: grid; gap: var(--cds-gap-lg); font-family: var(--font-anthropic-sans); }
 .dm-top { display: flex; align-items: center; justify-content: space-between; gap: var(--cds-gap-md); flex-wrap: wrap; }
@@ -1063,5 +1074,53 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
 </script>
 
 </div>
+<script>
+(() => {
+  const button = document.getElementById('manual-refresh-button');
+  const message = document.getElementById('manual-refresh-message');
+  const base = 'http://127.0.0.1:18765';
+  let polling = false;
+  async function request(path, options = {}) {
+    const response = await fetch(base + path, { ...options, cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error('接続できません');
+    return response.json();
+  }
+  function show(state) {
+    button.disabled = state.running;
+    button.textContent = state.running ? '更新中…' : '↻ 今すぐ更新';
+    message.textContent = state.message;
+    message.style.color = state.result === 'error' ? 'var(--color-bad)' : '';
+  }
+  async function follow(state) {
+    if (polling) return;
+    polling = true;
+    try {
+      const deadline = Date.now() + 21 * 60 * 1000;
+      while (state.running) {
+        show(state);
+        if (Date.now() > deadline) throw new Error('timeout');
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        state = await request('/status');
+      }
+      show(state);
+      if (state.result === 'ok') {
+        for (const id of ['total_daily','team_daily','sku_daily','month_total','month_sku','sync_status']) dash.refresh(id);
+        // Pagesの配信更新を待ってから表示中のデータも再取得する。
+        setTimeout(() => { for (const id of ['total_daily','team_daily','sku_daily','month_total','month_sku','sync_status']) dash.refresh(id); }, 120000);
+      }
+    } finally { polling = false; }
+  }
+  function disconnected() {
+    button.disabled = false; button.textContent = '↻ 今すぐ更新';
+    message.style.color = 'var(--color-warn)';
+    message.textContent = '更新用Macへの接続を確認できません。このMacで開き、ブラウザのローカルネットワーク接続を許可してください。実行済みの場合は処理が続いている可能性があります。';
+  }
+  button.addEventListener('click', async () => {
+    button.disabled = true; message.textContent = '更新用Macに接続しています…';
+    try { await follow(await request('/refresh', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})); }
+    catch (_) { disconnected(); }
+  });
+})();
+</script>
 </body>
 </html>
