@@ -246,7 +246,7 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
     </div>
     <div class="dm-kpis" id="dm-day-kpis">
       <div class="dm-card dm-kpi"><span class="dm-lbl">オーダー数</span><span class="dm-n"><span class="dash-skeleton" data-kpi="orders" data-source="total_daily" data-field="orders">—</span><small>件</small></span><span class="dm-delta" id="dm-day-d-orders"></span></div>
-      <div class="dm-card dm-kpi"><span class="dm-lbl">箱数</span><span class="dm-n"><span class="dash-skeleton" data-kpi="boxes" data-source="total_daily" data-field="boxes">—</span><small>箱</small></span><span class="dm-delta" id="dm-day-d-boxes"></span></div>
+      <div class="dm-card dm-kpi"><span class="dm-lbl">箱数</span><span class="dm-n"><span class="dash-skeleton" data-kpi="boxes" data-source="total_daily" data-field="boxes">—</span><small>箱</small></span><span class="dm-delta" id="dm-day-d-boxes"></span><span class="dm-delta" id="dm-day-avg-boxes"></span></div>
       <div class="dm-card dm-kpi"><span class="dm-lbl">出荷のあった商品</span><span class="dm-n"><span class="dash-skeleton" data-kpi="skus" data-source="total_daily" data-field="skus">—</span><small>SKU</small></span></div>
       <div class="dm-card dm-kpi"><span class="dm-lbl">1件あたりの箱数</span><span class="dm-n"><span class="dash-skeleton" id="dm-day-ratio" data-source="day_ratio" data-field="boxes_per_order">—</span><small>箱</small></span></div>
     </div>
@@ -461,6 +461,22 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
     if (v > 0) n.classList.add('up'); else if (v < 0) n.classList.add('down');
   }
 
+  // 前月の暦日すべてを分母にする（出荷なしの日も0箱として含む）。
+  function previousMonthAverage(rows, date) {
+    if (!date) return null;
+    const [y, m] = date.split('-').map(Number);
+    const month = new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
+    const days = new Date(Date.UTC(y, m - 1, 0)).getUTCDate();
+    const previous = rows.filter(r => r.date.startsWith(month));
+    return previous.length ? { month, days, boxes: previous.reduce((sum, r) => sum + Number(r.boxes), 0) / days } : null;
+  }
+  const fmtAverage = v => Number(v).toLocaleString('ja-JP', {maximumFractionDigits: 1, minimumFractionDigits: 1});
+  function averageDelta(cur, average) {
+    if (!average) return '前月平均比 —';
+    const delta = cur - average.boxes;
+    return `前月平均 ${fmtAverage(average.boxes)}箱/日 比 ${signed(delta, fmtAverage)}箱`;
+  }
+
   function teamCard(card, team, items, date, state, o) {
     card.replaceChildren();
     const id = card.dataset.team;
@@ -484,6 +500,11 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
       if (dl.textContent) dl.textContent = dl.textContent.replace('比 ', '比 箱数 ');
       sub.append(dl);
     }
+    if (state === 'ok') {
+      const avg = el('span', 'dm-delta', averageDelta(team ? Number(team.boxes) : 0, o.average));
+      avg.title = '前月の合計箱数 ÷ 前月の暦日数（出荷なしの日を含む）';
+      sub.append(avg);
+    }
     head.append(h, sub);
     card.append(head);
     const share = el('p', 'dm-share');
@@ -506,6 +527,7 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
     const tr = el('tr');
     const cols = [['short', '商品', ''], ['orders', 'オーダー', 'dm-num'], ['boxes', '箱数', 'dm-num']];
     if (o.prevDate) cols.push([null, `前日（${md(o.prevDate)}）比`, 'dm-num']);
+    cols.push([null, '前月平均 箱/日', 'dm-num'], [null, '平均比（箱）', 'dm-num']);
     cols.forEach(([f, label, cls]) => { const th = el('th', cls, label); if (f) th.dataset.field = f; th.scope = 'col'; tr.append(th); });
     const thead = el('thead'); thead.append(tr);
     const tbody = el('tbody');
@@ -519,6 +541,13 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
         const td = el('td', 'dm-num', signed(d)); if (d > 0) td.classList.add('up'); else if (d < 0) td.classList.add('down');
         row.append(td);
       }
+      const average = o.average ? (o.averageBoxes.get(r.sku) || 0) : null;
+      const avgCell = el('td', 'dm-num', average == null ? '—' : fmtAverage(average));
+      avgCell.title = o.average ? `${o.average.month}の合計箱数 ÷ ${o.average.days}暦日` : '比較できる前月データなし';
+      const delta = average == null ? null : Number(r.boxes) - average;
+      const avgDelta = el('td', 'dm-num', delta == null ? '—' : signed(delta, fmtAverage));
+      if (delta > 0) avgDelta.classList.add('up'); else if (delta < 0) avgDelta.classList.add('down');
+      row.append(avgCell, avgDelta);
       tbody.append(row);
     }
     t.append(thead, tbody);
@@ -552,6 +581,12 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
       n.textContent = row ? fmt(Number(row[f])) : ok ? '0' : '—';
     });
     for (const f of ['orders', 'boxes']) setDayDelta($(`#dm-day-d-${f}`), ok ? Number(row ? row[f] : 0) : null, prow ? Number(prow[f]) : null, prevDate);
+    const average = ok ? previousMonthAverage(tot.data, date) : null;
+    const avgNode = $('#dm-day-avg-boxes');
+    avgNode.textContent = ok ? averageDelta(row ? Number(row.boxes) : 0, average) : '';
+    avgNode.title = '前月の合計箱数 ÷ 前月の暦日数（出荷なしの日を含む）';
+    avgNode.classList.remove('up', 'down');
+    if (average) avgNode.classList.add((row ? Number(row.boxes) : 0) >= average.boxes ? 'up' : 'down');
     const rr = ok ? dr.data.find((r) => r.date === date) : null;
     const rn = $('#dm-day-ratio');
     if (rr || !ok) mark(rn, 'day_ratio', 'boxes_per_order', w); else unmark(rn);
@@ -569,7 +604,10 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
       const prevTeam = ok && prevDate ? tm.data.find((t) => t.date === prevDate && t.team_id === id) : null;
       const items = ok ? sk.data.filter((r) => r.date === date && r.team_id === id).sort((a, b) => Number(b.boxes) - Number(a.boxes)) : [];
       const prevBoxes = new Map(ok && prevDate ? sk.data.filter((r) => r.date === prevDate && r.team_id === id).map((r) => [r.sku, Number(r.boxes)]) : []);
-      teamCard(card, team, items, date, err ? 'error' : ok ? 'ok' : 'loading', { ...opts, prevDate, prevTeam, prevBoxes });
+      const teamAverage = average ? { ...average, boxes: tm.data.filter(r => r.date.startsWith(average.month) && r.team_id === id).reduce((sum, r) => sum + Number(r.boxes), 0) / average.days } : null;
+      const averageBoxes = new Map();
+      if (average) for (const r of sk.data.filter(r => r.date.startsWith(average.month) && r.team_id === id)) averageBoxes.set(r.sku, (averageBoxes.get(r.sku) || 0) + Number(r.boxes) / average.days);
+      teamCard(card, team, items, date, err ? 'error' : ok ? 'ok' : 'loading', { ...opts, prevDate, prevTeam, prevBoxes, average: teamAverage, averageBoxes });
       return card;
     };
     if (myTeam === 'all') {
