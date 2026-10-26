@@ -73,8 +73,9 @@ div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
   }
   function fetchInto(id) {
     const url = FILES[id] + '?t=' + Math.floor(Date.now() / 60000); // 1分ごとに新しいデータを取り直す
+    const requestedAtVersion = cache[id]?.ver || 0;
     fetch(url, { cache: 'no-store' }).then((r) => { if (!r.ok) throw new Error(`${r.status} ${url}`); return url.includes('.csv') ? r.text().then((t) => d3.csvParse(t)) : r.json(); })
-      .then((rows) => { const data = Array.isArray(rows) ? Array.from(rows) : (rows.rows || rows.data || []); cache[id] = { status: 'ok', data, columns: rows.columns || Object.keys(data[0] || {}), ver: ++ver, meta: [] }; schedule(); })
+      .then((rows) => { if ((cache[id]?.ver || 0) !== requestedAtVersion) return; const data = Array.isArray(rows) ? Array.from(rows) : (rows.rows || rows.data || []); cache[id] = { status: 'ok', data, columns: rows.columns || Object.keys(data[0] || {}), ver: ++ver, meta: [] }; schedule(); })
       .catch((e) => { if (cache[id].status !== 'ok') { cache[id] = { status: 'error', data: [], message: String(e), ver: ++ver }; schedule(); } });
   }
   function data(id) {
@@ -97,6 +98,13 @@ div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
   let lastW = 0;
   addEventListener('resize', () => { const w = document.documentElement.clientWidth; if (w !== lastW) { lastW = w; schedule(); } });
   window.dash = {
+    applySnapshot: (datasets) => {
+      for (const [id, rows] of Object.entries(datasets)) {
+        if (!FILES[id] || !Array.isArray(rows)) continue;
+        cache[id] = { status:'ok', data:rows, columns:Object.keys(rows[0] || {}), ver:++ver, meta:[] };
+      }
+      schedule();
+    },
     data, colors: ['#378ADD', '#1D9E75', '#D85A30', '#7F77DD', '#D4537E', '#BA7517', '#639922', '#888780'],
     calc: (id, o) => { calcs[id] = o; },
     loader: () => {},
@@ -115,7 +123,7 @@ div.dash-skeleton, .dm-chart.dash-skeleton { display: block; }
 <body>
 <div id="dash-root">
 <div class="manual-refresh">
-<small>このMacから実行</small><button id="manual-refresh-button" type="button">↻ 今すぐ更新</button>
+<small>シートを再読込・集計（このMac）</small><button id="manual-refresh-button" type="button">↻ 今すぐ更新</button>
 <div id="manual-refresh-message" role="status" aria-live="polite"></div>
 </div>
 <style>
@@ -1142,9 +1150,14 @@ th[aria-sort="ascending"] .dm-sort::after { content: " ↑"; }
       }
       show(state);
       if (state.result === 'ok') {
-        for (const id of ['total_daily','team_daily','sku_daily','month_total','month_sku','sync_status']) dash.refresh(id);
-        // Pagesの配信更新を待ってから表示中のデータも再取得する。
-        setTimeout(() => { for (const id of ['total_daily','team_daily','sku_daily','month_total','month_sku','sync_status']) dash.refresh(id); }, 120000);
+        const datasets = await request('/data');
+        dash.applySnapshot(datasets);
+        const status = datasets.sync_status?.[0];
+        message.textContent = status?.sheet_ok === false || status?.sheet_ok === 'false'
+          ? 'シートの再集計は完了しましたが、元サイト→シートの同期に失敗しています。最終同期をご確認ください。'
+          : '画面を最新のシート集計に更新しました。元サイト→シートの最終同期：' + (status?.sheet_at || '不明');
+        message.style.color = status?.sheet_ok === false ? 'var(--color-warn)' : '';
+
       }
     } finally { polling = false; }
   }
